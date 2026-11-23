@@ -84,6 +84,46 @@ def read_page(page_id: str) -> dict:
     raise ValueError("対象のページが見つかりません。")
 
 
+def add_neighbor_context(result: dict, pages: list[dict]) -> dict:
+    """同一資料内の前後1ページを、重複なく検索結果に付ける。"""
+    document_pages = [
+        page for page in pages
+        if page["document_id"] == result["document_id"]
+    ]
+    try:
+        index = next(
+            i for i, page in enumerate(document_pages)
+            if page["page_id"] == result["page_id"]
+        )
+    except StopIteration:
+        return {**result, "previous_page": None, "next_page": None,
+                "neighbor_pages": [], "context": []}
+
+    previous = document_pages[index - 1] if index > 0 else None
+    next_page = document_pages[index + 1] if index + 1 < len(document_pages) else None
+
+    # context には検索結果自身を含めるが、隣接ページとの重複を除いて返す。
+    context = []
+    seen = set()
+    for page in (previous, result, next_page):
+        if page is None:
+            continue
+        page_id = page["page_id"]
+        if page_id not in seen:
+            context.append(dict(page))
+            seen.add(page_id)
+
+    return {
+        **result,
+        "previous_page": dict(previous) if previous is not None else None,
+        "next_page": dict(next_page) if next_page is not None else None,
+        "neighbor_pages": [
+            dict(page) for page in (previous, next_page) if page is not None
+        ],
+        "context": context,
+    }
+
+
 def normalized_vector(values: list[float]) -> list[float]:
     """ベクトルの長さを1に揃える。"""
     norm = math.hypot(*values)
@@ -135,12 +175,15 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        hits = [dict(row) for row in rows]
+    pages = load_pages(RAG_SOURCE)
+    return [add_neighbor_context(hit, pages) for hit in hits]
 
 
 def search_graph(query: str) -> dict:
     """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
+    all_pages = list(pages.values())
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
              if node["kind"] == "term" or node["id"] in pages}
@@ -156,8 +199,9 @@ def search_graph(query: str) -> dict:
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
         root = seed["page_id"]
-        results.append({**pages[root], "distance": seed["distance"], "hops": 0,
-                        "path": [{"id": root, "title": pages[root]["title"]}]})
+        seed_result = {**pages[root], "distance": seed["distance"], "hops": 0,
+                       "path": [{"id": root, "title": pages[root]["title"]}]}
+        results.append(add_neighbor_context(seed_result, all_pages))
         queue = deque([(root, [root])])
         visited = {root}
         while queue:
@@ -176,8 +220,11 @@ def search_graph(query: str) -> dict:
                     continue
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
                 priority = (len(route) - 1, frequency, rank, neighbor)
-                candidate = {**pages[neighbor], "hops": len(route) - 1,
-                             "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
+                candidate = add_neighbor_context(
+                    {**pages[neighbor], "hops": len(route) - 1,
+                     "path": [{"id": n, "title": nodes[n]["title"]} for n in route]},
+                    all_pages,
+                )
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
     expanded = [candidate for _, candidate in sorted(candidates.values())]

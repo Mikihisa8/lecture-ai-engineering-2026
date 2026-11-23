@@ -54,3 +54,24 @@ def test_existing_index_survives_failed_rebuild(materials):
         build_index(source, database, rebuild=True, embedder=embed)
     assert database.read_bytes() == before
     assert not list(database.parent.glob(".rag-build-*"))
+
+
+def test_neighbor_context_stays_within_document_and_is_unique():
+    pages = [
+        {"page_id": "lec01-main-p001", "document_id": "lec01-main", "content": "一"},
+        {"page_id": "lec01-main-p002", "document_id": "lec01-main", "content": "二"},
+        {"page_id": "lec01-main-p003", "document_id": "lec01-main", "content": "三"},
+        {"page_id": "lec02-main-p001", "document_id": "lec02-main", "content": "別資料"},
+    ]
+
+    first = retrieval.add_neighbor_context(pages[0], pages)
+    assert first["previous_page"] is None
+    assert first["next_page"]["page_id"] == "lec01-main-p002"
+    assert [p["page_id"] for p in first["context"]] == [
+        "lec01-main-p001", "lec01-main-p002",
+    ]
+
+    middle = retrieval.add_neighbor_context(pages[1], pages)
+    assert [p["page_id"] for p in middle["context"]] == [
+        "lec01-main-p001", "lec01-main-p002", "lec01-main-p003",
+    ]
